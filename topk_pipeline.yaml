@@ -1,0 +1,181 @@
+# PIPELINE DEFINITION
+# Name: topk-selection-pipeline
+components:
+  comp-load-data-op:
+    executorLabel: exec-load-data-op
+    outputDefinitions:
+      parameters:
+        output_csv:
+          parameterType: STRING
+  comp-scoring-op:
+    executorLabel: exec-scoring-op
+    inputDefinitions:
+      parameters:
+        input_csv:
+          parameterType: STRING
+    outputDefinitions:
+      parameters:
+        output_csv:
+          parameterType: STRING
+  comp-topk-op:
+    executorLabel: exec-topk-op
+    inputDefinitions:
+      parameters:
+        input_csv:
+          parameterType: STRING
+        k:
+          defaultValue: 10.0
+          isOptional: true
+          parameterType: NUMBER_INTEGER
+    outputDefinitions:
+      parameters:
+        output_csv:
+          parameterType: STRING
+deploymentSpec:
+  executors:
+    exec-load-data-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - load_data_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.13.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'pandas' &&\
+          \ \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef load_data_op(output_csv: OutputPath(str)):\n    import pandas\
+          \ as pd\n    df = pd.read_csv(\"data/products_data.csv\")\n    df.to_csv(output_csv,\
+          \ index=False)\n\n"
+        image: python:3.9
+    exec-scoring-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - scoring_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.13.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'pandas' 'scikit-learn'\
+          \ && \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef scoring_op(input_csv: InputPath(str), output_csv: OutputPath(str)):\n\
+          \    import pandas as pd\n    from sklearn.preprocessing import MinMaxScaler\n\
+          \    df = pd.read_csv(input_csv)\n    df['price'] = pd.to_numeric(df['price'],\
+          \ errors='coerce')\n    df['available'] = df['available'].astype(int)\n\
+          \    df['tags'] = df['tags'].fillna('').apply(lambda x: len(str(x).split(',')))\n\
+          \    df['price_norm'] = 1 - MinMaxScaler().fit_transform(df[['price']])\n\
+          \    df['score'] = 0.5 * df['available'] + 0.3 * df['price_norm'] + 0.2\
+          \ * df['tags']\n    df.to_csv(output_csv, index=False)\n\n"
+        image: python:3.9
+    exec-topk-op:
+      container:
+        args:
+        - --executor_input
+        - '{{$}}'
+        - --function_to_execute
+        - topk_op
+        command:
+        - sh
+        - -c
+        - "\nif ! [ -x \"$(command -v pip)\" ]; then\n    python3 -m ensurepip ||\
+          \ python3 -m ensurepip --user || apt-get install python3-pip\nfi\n\nPIP_DISABLE_PIP_VERSION_CHECK=1\
+          \ python3 -m pip install --quiet --no-warn-script-location 'kfp==2.13.0'\
+          \ '--no-deps' 'typing-extensions>=3.7.4,<5; python_version<\"3.9\"'  &&\
+          \  python3 -m pip install --quiet --no-warn-script-location 'pandas' &&\
+          \ \"$0\" \"$@\"\n"
+        - sh
+        - -ec
+        - 'program_path=$(mktemp -d)
+
+
+          printf "%s" "$0" > "$program_path/ephemeral_component.py"
+
+          _KFP_RUNTIME=true python3 -m kfp.dsl.executor_main                         --component_module_path                         "$program_path/ephemeral_component.py"                         "$@"
+
+          '
+        - "\nimport kfp\nfrom kfp import dsl\nfrom kfp.dsl import *\nfrom typing import\
+          \ *\n\ndef topk_op(input_csv: InputPath(str), output_csv: OutputPath(str),\
+          \ k: int = 10):\n    import pandas as pd\n    df = pd.read_csv(input_csv)\n\
+          \    top_k = df.sort_values(by='score', ascending=False).head(k)\n    top_k.to_csv(output_csv,\
+          \ index=False)\n\n"
+        image: python:3.9
+pipelineInfo:
+  name: topk-selection-pipeline
+root:
+  dag:
+    tasks:
+      load-data-op:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-load-data-op
+        taskInfo:
+          name: load-data-op
+      scoring-op:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-scoring-op
+        dependentTasks:
+        - load-data-op
+        inputs:
+          parameters:
+            input_csv:
+              taskOutputParameter:
+                outputParameterKey: output_csv
+                producerTask: load-data-op
+        taskInfo:
+          name: scoring-op
+      topk-op:
+        cachingOptions:
+          enableCache: true
+        componentRef:
+          name: comp-topk-op
+        dependentTasks:
+        - scoring-op
+        inputs:
+          parameters:
+            input_csv:
+              taskOutputParameter:
+                outputParameterKey: output_csv
+                producerTask: scoring-op
+            k:
+              runtimeValue:
+                constant: 10.0
+        taskInfo:
+          name: topk-op
+schemaVersion: 2.1.0
+sdkVersion: kfp-2.13.0
