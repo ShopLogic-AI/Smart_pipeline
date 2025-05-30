@@ -1,0 +1,998 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ecommerce-ml-pipeline-
+  annotations: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.22, pipelines.kubeflow.org/pipeline_compilation_time: '2025-05-30T16:27:42.199829',
+    pipelines.kubeflow.org/pipeline_spec: '{"description": "Pipeline for eCommerce
+      scraping, scoring, and top-k selection", "inputs": [{"default": "localhost",
+      "name": "db_host", "optional": true, "type": "String"}, {"default": "root",
+      "name": "db_user", "optional": true, "type": "String"}, {"default": "", "name":
+      "db_password", "optional": true, "type": "String"}, {"default": "ecommerce_data",
+      "name": "db_name", "optional": true, "type": "String"}, {"default": "[\"rowingblazers.com\",
+      \"glossier.com\"]", "name": "domains_json", "optional": true, "type": "String"},
+      {"default": "3", "name": "n_clusters", "optional": true, "type": "Integer"},
+      {"default": "10", "name": "k", "optional": true, "type": "Integer"}], "name":
+      "ecommerce-ml-pipeline"}'}
+  labels: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.22}
+spec:
+  entrypoint: ecommerce-ml-pipeline
+  templates:
+  - name: data-processing-component
+    container:
+      args: [--db-host, '{{inputs.parameters.db_host}}', --db-user, '{{inputs.parameters.db_user}}',
+        --db-password, '{{inputs.parameters.db_password}}', --db-name, '{{inputs.parameters.db_name}}',
+        '----output-paths', /tmp/outputs/processed_data_path/data, /tmp/outputs/data_statistics/data]
+      command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+        'pandas' 'mysql-connector-python' 'scikit-learn' || PIP_DISABLE_PIP_VERSION_CHECK=1
+        python3 -m pip install --quiet --no-warn-script-location 'pandas' 'mysql-connector-python'
+        'scikit-learn' --user) && "$0" "$@"
+      - sh
+      - -ec
+      - |
+        program_path=$(mktemp)
+        printf "%s" "$0" > "$program_path"
+        python3 -u "$program_path" "$@"
+      - |
+        def data_processing_component(
+            db_host,
+            db_user,
+            db_password,
+            db_name
+        ):
+            import pandas as pd
+            import mysql.connector
+            import pickle
+            import os
+            from sklearn.preprocessing import MinMaxScaler
+            import json
+
+            conn = mysql.connector.connect(
+                host=db_host,
+                user=db_user,
+                password=db_password,
+                database=db_name
+            )
+
+            df = pd.read_sql("SELECT * FROM shopify_products_variants", conn)
+            conn.close()
+
+            initial_count = len(df)
+            df = df.dropna(subset=['price', 'available', 'grams'])
+            df = df[df['price'] > 0]
+            cleaned_count = len(df)
+
+            features = ['price', 'available', 'grams']
+            df_features = df[features].copy()
+
+            scaler = MinMaxScaler()
+            normalized_features = scaler.fit_transform(df_features)
+            df_normalized = pd.DataFrame(normalized_features, columns=features)
+
+            weights = {'price': 0.4, 'available': 0.3, 'grams': 0.3}
+            df_normalized['score'] = (
+                df_normalized['price'] * weights['price'] +
+                df_normalized['available'] * weights['available'] +
+                df_normalized['grams'] * weights['grams']
+            )
+
+            df['score'] = df_normalized['score']
+
+            df_sorted = df.sort_values(by='score', ascending=False)
+            df_unique = df_sorted.drop_duplicates(subset=['title'], keep='first').reset_index(drop=True)
+
+            os.makedirs('/tmp/data', exist_ok=True)
+            processed_path = '/tmp/data/processed_data.pkl'
+            scaler_path = '/tmp/data/scaler.pkl'
+
+            with open(processed_path, 'wb') as f:
+                pickle.dump(df_unique, f)
+
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(scaler, f)
+
+            stats = {
+                'initial_records': int(initial_count),
+                'cleaned_records': int(cleaned_count),
+                'unique_products': int(len(df_unique)),
+                'average_score': float(df_unique['score'].mean()),
+                'price_stats': {
+                    'mean': float(df_unique['price'].mean()),
+                    'min': float(df_unique['price'].min()),
+                    'max': float(df_unique['price'].max()),
+                    'std': float(df_unique['price'].std())
+                },
+                'vendors_count': int(df_unique['vendor'].nunique()),
+                'top_vendors': df_unique['vendor'].value_counts().head(5).to_dict()
+            }
+
+            from collections import namedtuple
+            output = namedtuple('Outputs', ['processed_data_path', 'data_statistics'])
+            return output(processed_path, json.dumps(stats, indent=2))
+
+        def _serialize_str(str_value: str) -> str:
+            if not isinstance(str_value, str):
+                raise TypeError('Value "{}" has type "{}" instead of str.'.format(
+                    str(str_value), str(type(str_value))))
+            return str_value
+
+        import argparse
+        _parser = argparse.ArgumentParser(prog='Data processing component', description='')
+        _parser.add_argument("--db-host", dest="db_host", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-user", dest="db_user", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-password", dest="db_password", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-name", dest="db_name", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("----output-paths", dest="_output_paths", type=str, nargs=2)
+        _parsed_args = vars(_parser.parse_args())
+        _output_files = _parsed_args.pop("_output_paths", [])
+
+        _outputs = data_processing_component(**_parsed_args)
+
+        _output_serializers = [
+            _serialize_str,
+            _serialize_str,
+
+        ]
+
+        import os
+        for idx, output_file in enumerate(_output_files):
+            try:
+                os.makedirs(os.path.dirname(output_file))
+            except OSError:
+                pass
+            with open(output_file, 'w') as f:
+                f.write(_output_serializers[idx](_outputs[idx]))
+      image: python:3.9
+    inputs:
+      parameters:
+      - {name: db_host}
+      - {name: db_name}
+      - {name: db_password}
+      - {name: db_user}
+    outputs:
+      parameters:
+      - name: data-processing-component-processed_data_path
+        valueFrom: {path: /tmp/outputs/processed_data_path/data}
+      artifacts:
+      - {name: data-processing-component-data_statistics, path: /tmp/outputs/data_statistics/data}
+      - {name: data-processing-component-processed_data_path, path: /tmp/outputs/processed_data_path/data}
+    metadata:
+      annotations: {pipelines.kubeflow.org/task_display_name: Data Processing, pipelines.kubeflow.org/component_spec: '{"implementation":
+          {"container": {"args": ["--db-host", {"inputValue": "db_host"}, "--db-user",
+          {"inputValue": "db_user"}, "--db-password", {"inputValue": "db_password"},
+          "--db-name", {"inputValue": "db_name"}, "----output-paths", {"outputPath":
+          "processed_data_path"}, {"outputPath": "data_statistics"}], "command": ["sh",
+          "-c", "(PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+          ''pandas'' ''mysql-connector-python'' ''scikit-learn'' || PIP_DISABLE_PIP_VERSION_CHECK=1
+          python3 -m pip install --quiet --no-warn-script-location ''pandas'' ''mysql-connector-python''
+          ''scikit-learn'' --user) && \"$0\" \"$@\"", "sh", "-ec", "program_path=$(mktemp)\nprintf
+          \"%s\" \"$0\" > \"$program_path\"\npython3 -u \"$program_path\" \"$@\"\n",
+          "def data_processing_component(\n    db_host,\n    db_user,\n    db_password,\n    db_name\n):\n    import
+          pandas as pd\n    import mysql.connector\n    import pickle\n    import
+          os\n    from sklearn.preprocessing import MinMaxScaler\n    import json\n\n    conn
+          = mysql.connector.connect(\n        host=db_host,\n        user=db_user,\n        password=db_password,\n        database=db_name\n    )\n\n    df
+          = pd.read_sql(\"SELECT * FROM shopify_products_variants\", conn)\n    conn.close()\n\n    initial_count
+          = len(df)\n    df = df.dropna(subset=[''price'', ''available'', ''grams''])\n    df
+          = df[df[''price''] > 0]\n    cleaned_count = len(df)\n\n    features = [''price'',
+          ''available'', ''grams'']\n    df_features = df[features].copy()\n\n    scaler
+          = MinMaxScaler()\n    normalized_features = scaler.fit_transform(df_features)\n    df_normalized
+          = pd.DataFrame(normalized_features, columns=features)\n\n    weights = {''price'':
+          0.4, ''available'': 0.3, ''grams'': 0.3}\n    df_normalized[''score''] =
+          (\n        df_normalized[''price''] * weights[''price''] +\n        df_normalized[''available'']
+          * weights[''available''] +\n        df_normalized[''grams''] * weights[''grams'']\n    )\n\n    df[''score'']
+          = df_normalized[''score'']\n\n    df_sorted = df.sort_values(by=''score'',
+          ascending=False)\n    df_unique = df_sorted.drop_duplicates(subset=[''title''],
+          keep=''first'').reset_index(drop=True)\n\n    os.makedirs(''/tmp/data'',
+          exist_ok=True)\n    processed_path = ''/tmp/data/processed_data.pkl''\n    scaler_path
+          = ''/tmp/data/scaler.pkl''\n\n    with open(processed_path, ''wb'') as f:\n        pickle.dump(df_unique,
+          f)\n\n    with open(scaler_path, ''wb'') as f:\n        pickle.dump(scaler,
+          f)\n\n    stats = {\n        ''initial_records'': int(initial_count),\n        ''cleaned_records'':
+          int(cleaned_count),\n        ''unique_products'': int(len(df_unique)),\n        ''average_score'':
+          float(df_unique[''score''].mean()),\n        ''price_stats'': {\n            ''mean'':
+          float(df_unique[''price''].mean()),\n            ''min'': float(df_unique[''price''].min()),\n            ''max'':
+          float(df_unique[''price''].max()),\n            ''std'': float(df_unique[''price''].std())\n        },\n        ''vendors_count'':
+          int(df_unique[''vendor''].nunique()),\n        ''top_vendors'': df_unique[''vendor''].value_counts().head(5).to_dict()\n    }\n\n    from
+          collections import namedtuple\n    output = namedtuple(''Outputs'', [''processed_data_path'',
+          ''data_statistics''])\n    return output(processed_path, json.dumps(stats,
+          indent=2))\n\ndef _serialize_str(str_value: str) -> str:\n    if not isinstance(str_value,
+          str):\n        raise TypeError(''Value \"{}\" has type \"{}\" instead of
+          str.''.format(\n            str(str_value), str(type(str_value))))\n    return
+          str_value\n\nimport argparse\n_parser = argparse.ArgumentParser(prog=''Data
+          processing component'', description='''')\n_parser.add_argument(\"--db-host\",
+          dest=\"db_host\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-user\",
+          dest=\"db_user\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-password\",
+          dest=\"db_password\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-name\",
+          dest=\"db_name\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"----output-paths\",
+          dest=\"_output_paths\", type=str, nargs=2)\n_parsed_args = vars(_parser.parse_args())\n_output_files
+          = _parsed_args.pop(\"_output_paths\", [])\n\n_outputs = data_processing_component(**_parsed_args)\n\n_output_serializers
+          = [\n    _serialize_str,\n    _serialize_str,\n\n]\n\nimport os\nfor idx,
+          output_file in enumerate(_output_files):\n    try:\n        os.makedirs(os.path.dirname(output_file))\n    except
+          OSError:\n        pass\n    with open(output_file, ''w'') as f:\n        f.write(_output_serializers[idx](_outputs[idx]))\n"],
+          "image": "python:3.9"}}, "inputs": [{"name": "db_host", "type": "String"},
+          {"name": "db_user", "type": "String"}, {"name": "db_password", "type": "String"},
+          {"name": "db_name", "type": "String"}], "name": "Data processing component",
+          "outputs": [{"name": "processed_data_path", "type": "String"}, {"name":
+          "data_statistics", "type": "String"}]}', pipelines.kubeflow.org/component_ref: '{}',
+        pipelines.kubeflow.org/arguments.parameters: '{"db_host": "{{inputs.parameters.db_host}}",
+          "db_name": "{{inputs.parameters.db_name}}", "db_password": "{{inputs.parameters.db_password}}",
+          "db_user": "{{inputs.parameters.db_user}}"}'}
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.22
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  - name: ecommerce-ml-pipeline
+    inputs:
+      parameters:
+      - {name: db_host}
+      - {name: db_name}
+      - {name: db_password}
+      - {name: db_user}
+      - {name: domains_json}
+      - {name: k}
+      - {name: n_clusters}
+    dag:
+      tasks:
+      - name: data-processing-component
+        template: data-processing-component
+        dependencies: [web-scraping-component]
+        arguments:
+          parameters:
+          - {name: db_host, value: '{{inputs.parameters.db_host}}'}
+          - {name: db_name, value: '{{inputs.parameters.db_name}}'}
+          - {name: db_password, value: '{{inputs.parameters.db_password}}'}
+          - {name: db_user, value: '{{inputs.parameters.db_user}}'}
+      - name: ml-training-component
+        template: ml-training-component
+        dependencies: [data-processing-component]
+        arguments:
+          parameters:
+          - {name: data-processing-component-processed_data_path, value: '{{tasks.data-processing-component.outputs.parameters.data-processing-component-processed_data_path}}'}
+          - {name: n_clusters, value: '{{inputs.parameters.n_clusters}}'}
+      - name: top-k-selection-component
+        template: top-k-selection-component
+        dependencies: [ml-training-component]
+        arguments:
+          parameters:
+          - {name: k, value: '{{inputs.parameters.k}}'}
+          - {name: ml-training-component-clustered_data_path, value: '{{tasks.ml-training-component.outputs.parameters.ml-training-component-clustered_data_path}}'}
+          - {name: ml-training-component-model_path, value: '{{tasks.ml-training-component.outputs.parameters.ml-training-component-model_path}}'}
+      - name: web-scraping-component
+        template: web-scraping-component
+        arguments:
+          parameters:
+          - {name: db_host, value: '{{inputs.parameters.db_host}}'}
+          - {name: db_name, value: '{{inputs.parameters.db_name}}'}
+          - {name: db_password, value: '{{inputs.parameters.db_password}}'}
+          - {name: db_user, value: '{{inputs.parameters.db_user}}'}
+          - {name: domains_json, value: '{{inputs.parameters.domains_json}}'}
+  - name: ml-training-component
+    container:
+      args: [--processed-data-path, '{{inputs.parameters.data-processing-component-processed_data_path}}',
+        --n-clusters, '{{inputs.parameters.n_clusters}}', '----output-paths', /tmp/outputs/model_path/data,
+        /tmp/outputs/clustered_data_path/data, /tmp/outputs/training_metrics/data]
+      command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+        'pandas' 'scikit-learn' || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip
+        install --quiet --no-warn-script-location 'pandas' 'scikit-learn' --user)
+        && "$0" "$@"
+      - sh
+      - -ec
+      - |
+        program_path=$(mktemp)
+        printf "%s" "$0" > "$program_path"
+        python3 -u "$program_path" "$@"
+      - |
+        def ml_training_component(
+            processed_data_path,
+            n_clusters = 3
+        ):
+            import pandas as pd
+            import pickle
+            import os
+            from sklearn.cluster import KMeans
+            from sklearn.ensemble import RandomForestRegressor
+            from sklearn.model_selection import train_test_split
+            from sklearn.metrics import mean_squared_error, r2_score, silhouette_score
+            from sklearn.preprocessing import MinMaxScaler
+            import json
+
+            with open(processed_data_path, 'rb') as f:
+                df_unique = pickle.load(f)
+
+            features = ['price', 'available', 'grams']
+            scaler = MinMaxScaler()
+            normalized_features = scaler.fit_transform(df_unique[features])
+
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            df_unique['cluster'] = kmeans.fit_predict(normalized_features)
+
+            silhouette_avg = silhouette_score(normalized_features, df_unique['cluster'])
+
+            X = df_unique[features + ['cluster']]
+            y = df_unique['score']
+
+            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+            rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+            rf_model.fit(X_train, y_train)
+
+            y_pred = rf_model.predict(X_test)
+            mse = mean_squared_error(y_test, y_pred)
+            r2 = r2_score(y_test, y_pred)
+
+            feature_importance = dict(zip(features + ['cluster'], rf_model.feature_importances_))
+
+            os.makedirs('/tmp/models', exist_ok=True)
+            model_path = '/tmp/models/rf_model.pkl'
+            clustered_data_path = '/tmp/models/clustered_data.pkl'
+            kmeans_path = '/tmp/models/kmeans_model.pkl'
+
+            with open(model_path, 'wb') as f:
+                pickle.dump(rf_model, f)
+
+            with open(clustered_data_path, 'wb') as f:
+                pickle.dump(df_unique, f)
+
+            with open(kmeans_path, 'wb') as f:
+                pickle.dump(kmeans, f)
+
+            metrics = {
+                'clustering_metrics': {
+                    'silhouette_score': float(silhouette_avg),
+                    'n_clusters': int(n_clusters),
+                    'cluster_sizes': df_unique['cluster'].value_counts().to_dict()
+                },
+                'regression_metrics': {
+                    'mse': float(mse),
+                    'r2_score': float(r2),
+                    'feature_importance': feature_importance
+                },
+                'data_info': {
+                    'training_samples': int(len(X_train)),
+                    'test_samples': int(len(X_test))
+                }
+            }
+
+            from collections import namedtuple
+            output = namedtuple('Outputs', ['model_path', 'clustered_data_path', 'training_metrics'])
+            return output(model_path, clustered_data_path, json.dumps(metrics, indent=2))
+
+        def _serialize_str(str_value: str) -> str:
+            if not isinstance(str_value, str):
+                raise TypeError('Value "{}" has type "{}" instead of str.'.format(
+                    str(str_value), str(type(str_value))))
+            return str_value
+
+        import argparse
+        _parser = argparse.ArgumentParser(prog='Ml training component', description='')
+        _parser.add_argument("--processed-data-path", dest="processed_data_path", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--n-clusters", dest="n_clusters", type=int, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("----output-paths", dest="_output_paths", type=str, nargs=3)
+        _parsed_args = vars(_parser.parse_args())
+        _output_files = _parsed_args.pop("_output_paths", [])
+
+        _outputs = ml_training_component(**_parsed_args)
+
+        _output_serializers = [
+            _serialize_str,
+            _serialize_str,
+            _serialize_str,
+
+        ]
+
+        import os
+        for idx, output_file in enumerate(_output_files):
+            try:
+                os.makedirs(os.path.dirname(output_file))
+            except OSError:
+                pass
+            with open(output_file, 'w') as f:
+                f.write(_output_serializers[idx](_outputs[idx]))
+      image: python:3.9
+    inputs:
+      parameters:
+      - {name: data-processing-component-processed_data_path}
+      - {name: n_clusters}
+    outputs:
+      parameters:
+      - name: ml-training-component-clustered_data_path
+        valueFrom: {path: /tmp/outputs/clustered_data_path/data}
+      - name: ml-training-component-model_path
+        valueFrom: {path: /tmp/outputs/model_path/data}
+      artifacts:
+      - {name: ml-training-component-clustered_data_path, path: /tmp/outputs/clustered_data_path/data}
+      - {name: ml-training-component-model_path, path: /tmp/outputs/model_path/data}
+      - {name: ml-training-component-training_metrics, path: /tmp/outputs/training_metrics/data}
+    metadata:
+      annotations: {pipelines.kubeflow.org/task_display_name: ML Training, pipelines.kubeflow.org/component_spec: '{"implementation":
+          {"container": {"args": ["--processed-data-path", {"inputValue": "processed_data_path"},
+          {"if": {"cond": {"isPresent": "n_clusters"}, "then": ["--n-clusters", {"inputValue":
+          "n_clusters"}]}}, "----output-paths", {"outputPath": "model_path"}, {"outputPath":
+          "clustered_data_path"}, {"outputPath": "training_metrics"}], "command":
+          ["sh", "-c", "(PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet
+          --no-warn-script-location ''pandas'' ''scikit-learn'' || PIP_DISABLE_PIP_VERSION_CHECK=1
+          python3 -m pip install --quiet --no-warn-script-location ''pandas'' ''scikit-learn''
+          --user) && \"$0\" \"$@\"", "sh", "-ec", "program_path=$(mktemp)\nprintf
+          \"%s\" \"$0\" > \"$program_path\"\npython3 -u \"$program_path\" \"$@\"\n",
+          "def ml_training_component(\n    processed_data_path,\n    n_clusters =
+          3\n):\n    import pandas as pd\n    import pickle\n    import os\n    from
+          sklearn.cluster import KMeans\n    from sklearn.ensemble import RandomForestRegressor\n    from
+          sklearn.model_selection import train_test_split\n    from sklearn.metrics
+          import mean_squared_error, r2_score, silhouette_score\n    from sklearn.preprocessing
+          import MinMaxScaler\n    import json\n\n    with open(processed_data_path,
+          ''rb'') as f:\n        df_unique = pickle.load(f)\n\n    features = [''price'',
+          ''available'', ''grams'']\n    scaler = MinMaxScaler()\n    normalized_features
+          = scaler.fit_transform(df_unique[features])\n\n    kmeans = KMeans(n_clusters=n_clusters,
+          random_state=42)\n    df_unique[''cluster''] = kmeans.fit_predict(normalized_features)\n\n    silhouette_avg
+          = silhouette_score(normalized_features, df_unique[''cluster''])\n\n    X
+          = df_unique[features + [''cluster'']]\n    y = df_unique[''score'']\n\n    X_train,
+          X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)\n\n    rf_model
+          = RandomForestRegressor(n_estimators=100, random_state=42)\n    rf_model.fit(X_train,
+          y_train)\n\n    y_pred = rf_model.predict(X_test)\n    mse = mean_squared_error(y_test,
+          y_pred)\n    r2 = r2_score(y_test, y_pred)\n\n    feature_importance = dict(zip(features
+          + [''cluster''], rf_model.feature_importances_))\n\n    os.makedirs(''/tmp/models'',
+          exist_ok=True)\n    model_path = ''/tmp/models/rf_model.pkl''\n    clustered_data_path
+          = ''/tmp/models/clustered_data.pkl''\n    kmeans_path = ''/tmp/models/kmeans_model.pkl''\n\n    with
+          open(model_path, ''wb'') as f:\n        pickle.dump(rf_model, f)\n\n    with
+          open(clustered_data_path, ''wb'') as f:\n        pickle.dump(df_unique,
+          f)\n\n    with open(kmeans_path, ''wb'') as f:\n        pickle.dump(kmeans,
+          f)\n\n    metrics = {\n        ''clustering_metrics'': {\n            ''silhouette_score'':
+          float(silhouette_avg),\n            ''n_clusters'': int(n_clusters),\n            ''cluster_sizes'':
+          df_unique[''cluster''].value_counts().to_dict()\n        },\n        ''regression_metrics'':
+          {\n            ''mse'': float(mse),\n            ''r2_score'': float(r2),\n            ''feature_importance'':
+          feature_importance\n        },\n        ''data_info'': {\n            ''training_samples'':
+          int(len(X_train)),\n            ''test_samples'': int(len(X_test))\n        }\n    }\n\n    from
+          collections import namedtuple\n    output = namedtuple(''Outputs'', [''model_path'',
+          ''clustered_data_path'', ''training_metrics''])\n    return output(model_path,
+          clustered_data_path, json.dumps(metrics, indent=2))\n\ndef _serialize_str(str_value:
+          str) -> str:\n    if not isinstance(str_value, str):\n        raise TypeError(''Value
+          \"{}\" has type \"{}\" instead of str.''.format(\n            str(str_value),
+          str(type(str_value))))\n    return str_value\n\nimport argparse\n_parser
+          = argparse.ArgumentParser(prog=''Ml training component'', description='''')\n_parser.add_argument(\"--processed-data-path\",
+          dest=\"processed_data_path\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--n-clusters\",
+          dest=\"n_clusters\", type=int, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"----output-paths\",
+          dest=\"_output_paths\", type=str, nargs=3)\n_parsed_args = vars(_parser.parse_args())\n_output_files
+          = _parsed_args.pop(\"_output_paths\", [])\n\n_outputs = ml_training_component(**_parsed_args)\n\n_output_serializers
+          = [\n    _serialize_str,\n    _serialize_str,\n    _serialize_str,\n\n]\n\nimport
+          os\nfor idx, output_file in enumerate(_output_files):\n    try:\n        os.makedirs(os.path.dirname(output_file))\n    except
+          OSError:\n        pass\n    with open(output_file, ''w'') as f:\n        f.write(_output_serializers[idx](_outputs[idx]))\n"],
+          "image": "python:3.9"}}, "inputs": [{"name": "processed_data_path", "type":
+          "String"}, {"default": "3", "name": "n_clusters", "optional": true, "type":
+          "Integer"}], "name": "Ml training component", "outputs": [{"name": "model_path",
+          "type": "String"}, {"name": "clustered_data_path", "type": "String"}, {"name":
+          "training_metrics", "type": "String"}]}', pipelines.kubeflow.org/component_ref: '{}',
+        pipelines.kubeflow.org/arguments.parameters: '{"n_clusters": "{{inputs.parameters.n_clusters}}",
+          "processed_data_path": "{{inputs.parameters.data-processing-component-processed_data_path}}"}'}
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.22
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  - name: top-k-selection-component
+    container:
+      args: [--clustered-data-path, '{{inputs.parameters.ml-training-component-clustered_data_path}}',
+        --model-path, '{{inputs.parameters.ml-training-component-model_path}}', --k,
+        '{{inputs.parameters.k}}', '----output-paths', /tmp/outputs/top_k_results/data,
+        /tmp/outputs/evaluation_report/data]
+      command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+        'pandas' 'scikit-learn' || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip
+        install --quiet --no-warn-script-location 'pandas' 'scikit-learn' --user)
+        && "$0" "$@"
+      - sh
+      - -ec
+      - |
+        program_path=$(mktemp)
+        printf "%s" "$0" > "$program_path"
+        python3 -u "$program_path" "$@"
+      - |
+        def top_k_selection_component(
+            clustered_data_path,
+            model_path,
+            k = 10
+        ):
+            import pandas as pd
+            import pickle
+            import json
+            from sklearn.metrics import mean_absolute_error
+
+            with open(clustered_data_path, 'rb') as f:
+                df_unique = pickle.load(f)
+
+            with open(model_path, 'rb') as f:
+                rf_model = pickle.load(f)
+
+            top_k_products = df_unique.head(k)
+
+            features = ['price', 'available', 'grams', 'cluster']
+            X_top_k = top_k_products[features]
+            predicted_scores = rf_model.predict(X_top_k)
+
+            top_k_results = top_k_products.copy()
+            top_k_results['predicted_score'] = predicted_scores
+            top_k_results['score_difference'] = top_k_results['score'] - top_k_results['predicted_score']
+
+            mae = mean_absolute_error(top_k_results['score'], predicted_scores)
+
+            top_k_summary = {
+                'top_k_count': int(k),
+                'selected_products': [
+                    {
+                        'title': row['title'],
+                        'vendor': row['vendor'],
+                        'price': float(row['price']),
+                        'score': float(row['score']),
+                        'predicted_score': float(row['predicted_score']),
+                        'cluster': int(row['cluster'])
+                    }
+                    for _, row in top_k_results.iterrows()
+                ],
+                'summary_stats': {
+                    'average_price': float(top_k_results['price'].mean()),
+                    'price_range': [float(top_k_results['price'].min()), float(top_k_results['price'].max())],
+                    'vendor_distribution': top_k_results['vendor'].value_counts().to_dict(),
+                    'cluster_distribution': top_k_results['cluster'].value_counts().to_dict(),
+                    'average_score': float(top_k_results['score'].mean())
+                }
+            }
+
+            evaluation_report = {
+                'model_performance': {
+                    'mean_absolute_error': float(mae),
+                    'score_correlation': float(top_k_results[['score', 'predicted_score']].corr().iloc[0, 1])
+                },
+                'business_recommendations': {
+                    'best_performing_cluster': int(top_k_results.groupby('cluster')['score'].mean().idxmax()),
+                    'most_represented_vendor': top_k_results['vendor'].mode().iloc[0],
+                    'optimal_price_range': [
+                        float(top_k_results[top_k_results['score'] >= top_k_results['score'].quantile(0.8)]['price'].min()),
+                        float(top_k_results[top_k_results['score'] >= top_k_results['score'].quantile(0.8)]['price'].max())
+                    ]
+                }
+            }
+
+            from collections import namedtuple
+            output = namedtuple('Outputs', ['top_k_results', 'evaluation_report'])
+            return output(json.dumps(top_k_summary, indent=2), json.dumps(evaluation_report, indent=2))
+
+        def _serialize_str(str_value: str) -> str:
+            if not isinstance(str_value, str):
+                raise TypeError('Value "{}" has type "{}" instead of str.'.format(
+                    str(str_value), str(type(str_value))))
+            return str_value
+
+        import argparse
+        _parser = argparse.ArgumentParser(prog='Top k selection component', description='')
+        _parser.add_argument("--clustered-data-path", dest="clustered_data_path", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--model-path", dest="model_path", type=str, required=True, default=argparse.SUPPRESS)
+        _parser.add_argument("--k", dest="k", type=int, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("----output-paths", dest="_output_paths", type=str, nargs=2)
+        _parsed_args = vars(_parser.parse_args())
+        _output_files = _parsed_args.pop("_output_paths", [])
+
+        _outputs = top_k_selection_component(**_parsed_args)
+
+        _output_serializers = [
+            _serialize_str,
+            _serialize_str,
+
+        ]
+
+        import os
+        for idx, output_file in enumerate(_output_files):
+            try:
+                os.makedirs(os.path.dirname(output_file))
+            except OSError:
+                pass
+            with open(output_file, 'w') as f:
+                f.write(_output_serializers[idx](_outputs[idx]))
+      image: python:3.9
+    inputs:
+      parameters:
+      - {name: k}
+      - {name: ml-training-component-clustered_data_path}
+      - {name: ml-training-component-model_path}
+    outputs:
+      artifacts:
+      - {name: top-k-selection-component-evaluation_report, path: /tmp/outputs/evaluation_report/data}
+      - {name: top-k-selection-component-top_k_results, path: /tmp/outputs/top_k_results/data}
+    metadata:
+      annotations: {pipelines.kubeflow.org/task_display_name: Top-K Selection, pipelines.kubeflow.org/component_spec: '{"implementation":
+          {"container": {"args": ["--clustered-data-path", {"inputValue": "clustered_data_path"},
+          "--model-path", {"inputValue": "model_path"}, {"if": {"cond": {"isPresent":
+          "k"}, "then": ["--k", {"inputValue": "k"}]}}, "----output-paths", {"outputPath":
+          "top_k_results"}, {"outputPath": "evaluation_report"}], "command": ["sh",
+          "-c", "(PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+          ''pandas'' ''scikit-learn'' || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m
+          pip install --quiet --no-warn-script-location ''pandas'' ''scikit-learn''
+          --user) && \"$0\" \"$@\"", "sh", "-ec", "program_path=$(mktemp)\nprintf
+          \"%s\" \"$0\" > \"$program_path\"\npython3 -u \"$program_path\" \"$@\"\n",
+          "def top_k_selection_component(\n    clustered_data_path,\n    model_path,\n    k
+          = 10\n):\n    import pandas as pd\n    import pickle\n    import json\n    from
+          sklearn.metrics import mean_absolute_error\n\n    with open(clustered_data_path,
+          ''rb'') as f:\n        df_unique = pickle.load(f)\n\n    with open(model_path,
+          ''rb'') as f:\n        rf_model = pickle.load(f)\n\n    top_k_products =
+          df_unique.head(k)\n\n    features = [''price'', ''available'', ''grams'',
+          ''cluster'']\n    X_top_k = top_k_products[features]\n    predicted_scores
+          = rf_model.predict(X_top_k)\n\n    top_k_results = top_k_products.copy()\n    top_k_results[''predicted_score'']
+          = predicted_scores\n    top_k_results[''score_difference''] = top_k_results[''score'']
+          - top_k_results[''predicted_score'']\n\n    mae = mean_absolute_error(top_k_results[''score''],
+          predicted_scores)\n\n    top_k_summary = {\n        ''top_k_count'': int(k),\n        ''selected_products'':
+          [\n            {\n                ''title'': row[''title''],\n                ''vendor'':
+          row[''vendor''],\n                ''price'': float(row[''price'']),\n                ''score'':
+          float(row[''score'']),\n                ''predicted_score'': float(row[''predicted_score'']),\n                ''cluster'':
+          int(row[''cluster''])\n            }\n            for _, row in top_k_results.iterrows()\n        ],\n        ''summary_stats'':
+          {\n            ''average_price'': float(top_k_results[''price''].mean()),\n            ''price_range'':
+          [float(top_k_results[''price''].min()), float(top_k_results[''price''].max())],\n            ''vendor_distribution'':
+          top_k_results[''vendor''].value_counts().to_dict(),\n            ''cluster_distribution'':
+          top_k_results[''cluster''].value_counts().to_dict(),\n            ''average_score'':
+          float(top_k_results[''score''].mean())\n        }\n    }\n\n    evaluation_report
+          = {\n        ''model_performance'': {\n            ''mean_absolute_error'':
+          float(mae),\n            ''score_correlation'': float(top_k_results[[''score'',
+          ''predicted_score'']].corr().iloc[0, 1])\n        },\n        ''business_recommendations'':
+          {\n            ''best_performing_cluster'': int(top_k_results.groupby(''cluster'')[''score''].mean().idxmax()),\n            ''most_represented_vendor'':
+          top_k_results[''vendor''].mode().iloc[0],\n            ''optimal_price_range'':
+          [\n                float(top_k_results[top_k_results[''score''] >= top_k_results[''score''].quantile(0.8)][''price''].min()),\n                float(top_k_results[top_k_results[''score'']
+          >= top_k_results[''score''].quantile(0.8)][''price''].max())\n            ]\n        }\n    }\n\n    from
+          collections import namedtuple\n    output = namedtuple(''Outputs'', [''top_k_results'',
+          ''evaluation_report''])\n    return output(json.dumps(top_k_summary, indent=2),
+          json.dumps(evaluation_report, indent=2))\n\ndef _serialize_str(str_value:
+          str) -> str:\n    if not isinstance(str_value, str):\n        raise TypeError(''Value
+          \"{}\" has type \"{}\" instead of str.''.format(\n            str(str_value),
+          str(type(str_value))))\n    return str_value\n\nimport argparse\n_parser
+          = argparse.ArgumentParser(prog=''Top k selection component'', description='''')\n_parser.add_argument(\"--clustered-data-path\",
+          dest=\"clustered_data_path\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--model-path\",
+          dest=\"model_path\", type=str, required=True, default=argparse.SUPPRESS)\n_parser.add_argument(\"--k\",
+          dest=\"k\", type=int, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"----output-paths\",
+          dest=\"_output_paths\", type=str, nargs=2)\n_parsed_args = vars(_parser.parse_args())\n_output_files
+          = _parsed_args.pop(\"_output_paths\", [])\n\n_outputs = top_k_selection_component(**_parsed_args)\n\n_output_serializers
+          = [\n    _serialize_str,\n    _serialize_str,\n\n]\n\nimport os\nfor idx,
+          output_file in enumerate(_output_files):\n    try:\n        os.makedirs(os.path.dirname(output_file))\n    except
+          OSError:\n        pass\n    with open(output_file, ''w'') as f:\n        f.write(_output_serializers[idx](_outputs[idx]))\n"],
+          "image": "python:3.9"}}, "inputs": [{"name": "clustered_data_path", "type":
+          "String"}, {"name": "model_path", "type": "String"}, {"default": "10", "name":
+          "k", "optional": true, "type": "Integer"}], "name": "Top k selection component",
+          "outputs": [{"name": "top_k_results", "type": "String"}, {"name": "evaluation_report",
+          "type": "String"}]}', pipelines.kubeflow.org/component_ref: '{}', pipelines.kubeflow.org/arguments.parameters: '{"clustered_data_path":
+          "{{inputs.parameters.ml-training-component-clustered_data_path}}", "k":
+          "{{inputs.parameters.k}}", "model_path": "{{inputs.parameters.ml-training-component-model_path}}"}'}
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.22
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  - name: web-scraping-component
+    container:
+      args: [--domains-json, '{{inputs.parameters.domains_json}}', --db-host, '{{inputs.parameters.db_host}}',
+        --db-user, '{{inputs.parameters.db_user}}', --db-password, '{{inputs.parameters.db_password}}',
+        --db-name, '{{inputs.parameters.db_name}}', '----output-paths', /tmp/outputs/scraping_status/data,
+        /tmp/outputs/products_scraped/data]
+      command:
+      - sh
+      - -c
+      - (PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip install --quiet --no-warn-script-location
+        'mysql-connector-python' 'beautifulsoup4' 'requests' 'pandas' || PIP_DISABLE_PIP_VERSION_CHECK=1
+        python3 -m pip install --quiet --no-warn-script-location 'mysql-connector-python'
+        'beautifulsoup4' 'requests' 'pandas' --user) && "$0" "$@"
+      - sh
+      - -ec
+      - |
+        program_path=$(mktemp)
+        printf "%s" "$0" > "$program_path"
+        python3 -u "$program_path" "$@"
+      - |
+        def web_scraping_component(
+            domains_json = '["rowingblazers.com"]',
+            db_host = 'localhost',
+            db_user = 'root',
+            db_password = '',
+            db_name = 'ecommerce_data'
+        ):
+            from bs4 import BeautifulSoup
+            import mysql.connector
+            import requests
+            from datetime import datetime
+            import logging
+
+            logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+            def clean_html(html):
+                return BeautifulSoup(html, "html.parser").get_text(separator=" ", strip=True)
+
+            def safe_get(obj, *keys, default=None):
+                for key in keys:
+                    obj = obj.get(key) if isinstance(obj, dict) else None
+                    if obj is None:
+                        return default
+                return obj
+
+            def parse_datetime(dt_str):
+                try:
+                    return datetime.fromisoformat(dt_str.replace('Z', '+00:00')).strftime('%Y-%m-%d %H:%M:%S')
+                except:
+                    return None
+
+            def insert_variant(cursor, product, variant, product_image, variant_image):
+                query = """
+                INSERT INTO shopify_products_variants (
+                    product_id, title, handle, description, vendor, product_type, tags,
+                    published_at, created_at, updated_at,
+                    variant_id, variant_title, option1, option2, option3, sku, requires_shipping,
+                    taxable, available, price, compare_at_price, grams,
+                    variant_created_at, variant_updated_at,
+                    variant_featured_image_url, variant_featured_image_width, variant_featured_image_height,
+                    product_main_image_url, product_main_image_width, product_main_image_height,
+                    option_color, option_size
+                ) VALUES (
+                    %(product_id)s, %(title)s, %(handle)s, %(description)s, %(vendor)s, %(product_type)s, %(tags)s,
+                    %(published_at)s, %(created_at)s, %(updated_at)s,
+                    %(variant_id)s, %(variant_title)s, %(option1)s, %(option2)s, %(option3)s, %(sku)s, %(requires_shipping)s,
+                    %(taxable)s, %(available)s, %(price)s, %(compare_at_price)s, %(grams)s,
+                    %(variant_created_at)s, %(variant_updated_at)s,
+                    %(variant_featured_image_url)s, %(variant_featured_image_width)s, %(variant_featured_image_height)s,
+                    %(product_main_image_url)s, %(product_main_image_width)s, %(product_main_image_height)s,
+                    %(option_color)s, %(option_size)s
+                )
+                ON DUPLICATE KEY UPDATE variant_updated_at=VALUES(variant_updated_at), price=VALUES(price), available=VALUES(available);
+                """
+
+                data = {
+                    'product_id': product.get('id'),
+                    'title': product.get('title'),
+                    'handle': product.get('handle'),
+                    'description': clean_html(product.get('body_html', '')),
+                    'vendor': product.get('vendor'),
+                    'product_type': product.get('product_type'),
+                    'tags': json.dumps(product.get('tags', [])),
+                    'published_at': parse_datetime(product.get('published_at')),
+                    'created_at': parse_datetime(product.get('created_at')),
+                    'updated_at': parse_datetime(product.get('updated_at')),
+
+                    'variant_id': variant.get('id'),
+                    'variant_title': variant.get('title'),
+                    'option1': variant.get('option1'),
+                    'option2': variant.get('option2'),
+                    'option3': variant.get('option3'),
+                    'sku': variant.get('sku'),
+                    'requires_shipping': variant.get('requires_shipping'),
+                    'taxable': variant.get('taxable'),
+                    'available': variant.get('available'),
+                    'price': float(variant.get('price')) if variant.get('price') else None,
+                    'compare_at_price': float(variant.get('compare_at_price')) if variant.get('compare_at_price') else None,
+                    'grams': variant.get('grams'),
+                    'variant_created_at': parse_datetime(variant.get('created_at')),
+                    'variant_updated_at': parse_datetime(variant.get('updated_at')),
+
+                    'variant_featured_image_url': safe_get(variant_image, 'src'),
+                    'variant_featured_image_width': safe_get(variant_image, 'width'),
+                    'variant_featured_image_height': safe_get(variant_image, 'height'),
+
+                    'product_main_image_url': safe_get(product_image, 'src'),
+                    'product_main_image_width': safe_get(product_image, 'width'),
+                    'product_main_image_height': safe_get(product_image, 'height'),
+
+                    'option_color': variant.get('option1'),
+                    'option_size': variant.get('option2')
+                }
+
+                cursor.execute(query, data)
+
+            def scrape_and_insert(domain, conn):
+                page = 1
+                cursor = conn.cursor()
+                total_products = 0
+                while True:
+                    try:
+                        response = requests.get(f"https://{domain}/products.json?page={page}", timeout=30)
+                        if response.status_code != 200:
+                            break
+                        data = response.json().get('products', [])
+                        if not data:
+                            break
+                        for product in data:
+                            product_image = product.get('images', [{}])[0] if product.get('images') else {}
+                            for variant in product.get('variants', []):
+                                variant_image = variant.get('featured_image', {}) or {}
+                                insert_variant(cursor, product, variant, product_image, variant_image)
+                                total_products += 1
+                        page += 1
+                    except Exception as e:
+                        break
+                conn.commit()
+                cursor.close()
+                return total_products
+
+            domains = json.loads(domains_json)
+            total_scraped = 0
+            success = []
+            fail = []
+            try:
+                conn = mysql.connector.connect(host=db_host, user=db_user, password=db_password, database=db_name)
+                for domain in domains:
+                    try:
+                        count = scrape_and_insert(domain, conn)
+                        total_scraped += count
+                        success.append(domain)
+                    except:
+                        fail.append(domain)
+                conn.close()
+                return json.dumps({'status': 'done', 'ok': success, 'fail': fail}), str(total_scraped)
+            except Exception as e:
+                return json.dumps({'status': 'error', 'error': str(e)}), "0"
+
+        def _serialize_str(str_value: str) -> str:
+            if not isinstance(str_value, str):
+                raise TypeError('Value "{}" has type "{}" instead of str.'.format(
+                    str(str_value), str(type(str_value))))
+            return str_value
+
+        import argparse
+        _parser = argparse.ArgumentParser(prog='Web scraping component', description='')
+        _parser.add_argument("--domains-json", dest="domains_json", type=str, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-host", dest="db_host", type=str, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-user", dest="db_user", type=str, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-password", dest="db_password", type=str, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("--db-name", dest="db_name", type=str, required=False, default=argparse.SUPPRESS)
+        _parser.add_argument("----output-paths", dest="_output_paths", type=str, nargs=2)
+        _parsed_args = vars(_parser.parse_args())
+        _output_files = _parsed_args.pop("_output_paths", [])
+
+        _outputs = web_scraping_component(**_parsed_args)
+
+        _output_serializers = [
+            _serialize_str,
+            _serialize_str,
+
+        ]
+
+        import os
+        for idx, output_file in enumerate(_output_files):
+            try:
+                os.makedirs(os.path.dirname(output_file))
+            except OSError:
+                pass
+            with open(output_file, 'w') as f:
+                f.write(_output_serializers[idx](_outputs[idx]))
+      image: python:3.9
+    inputs:
+      parameters:
+      - {name: db_host}
+      - {name: db_name}
+      - {name: db_password}
+      - {name: db_user}
+      - {name: domains_json}
+    outputs:
+      artifacts:
+      - {name: web-scraping-component-products_scraped, path: /tmp/outputs/products_scraped/data}
+      - {name: web-scraping-component-scraping_status, path: /tmp/outputs/scraping_status/data}
+    metadata:
+      annotations: {pipelines.kubeflow.org/task_display_name: Web Scraping, pipelines.kubeflow.org/component_spec: '{"implementation":
+          {"container": {"args": [{"if": {"cond": {"isPresent": "domains_json"}, "then":
+          ["--domains-json", {"inputValue": "domains_json"}]}}, {"if": {"cond": {"isPresent":
+          "db_host"}, "then": ["--db-host", {"inputValue": "db_host"}]}}, {"if": {"cond":
+          {"isPresent": "db_user"}, "then": ["--db-user", {"inputValue": "db_user"}]}},
+          {"if": {"cond": {"isPresent": "db_password"}, "then": ["--db-password",
+          {"inputValue": "db_password"}]}}, {"if": {"cond": {"isPresent": "db_name"},
+          "then": ["--db-name", {"inputValue": "db_name"}]}}, "----output-paths",
+          {"outputPath": "scraping_status"}, {"outputPath": "products_scraped"}],
+          "command": ["sh", "-c", "(PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip
+          install --quiet --no-warn-script-location ''mysql-connector-python'' ''beautifulsoup4''
+          ''requests'' ''pandas'' || PIP_DISABLE_PIP_VERSION_CHECK=1 python3 -m pip
+          install --quiet --no-warn-script-location ''mysql-connector-python'' ''beautifulsoup4''
+          ''requests'' ''pandas'' --user) && \"$0\" \"$@\"", "sh", "-ec", "program_path=$(mktemp)\nprintf
+          \"%s\" \"$0\" > \"$program_path\"\npython3 -u \"$program_path\" \"$@\"\n",
+          "def web_scraping_component(\n    domains_json = ''[\"rowingblazers.com\"]'',\n    db_host
+          = ''localhost'',\n    db_user = ''root'',\n    db_password = '''',\n    db_name
+          = ''ecommerce_data''\n):\n    from bs4 import BeautifulSoup\n    import
+          mysql.connector\n    import requests\n    from datetime import datetime\n    import
+          logging\n\n    logging.basicConfig(level=logging.INFO, format=''%(asctime)s
+          - %(levelname)s - %(message)s'')\n\n    def clean_html(html):\n        return
+          BeautifulSoup(html, \"html.parser\").get_text(separator=\" \", strip=True)\n\n    def
+          safe_get(obj, *keys, default=None):\n        for key in keys:\n            obj
+          = obj.get(key) if isinstance(obj, dict) else None\n            if obj is
+          None:\n                return default\n        return obj\n\n    def parse_datetime(dt_str):\n        try:\n            return
+          datetime.fromisoformat(dt_str.replace(''Z'', ''+00:00'')).strftime(''%Y-%m-%d
+          %H:%M:%S'')\n        except:\n            return None\n\n    def insert_variant(cursor,
+          product, variant, product_image, variant_image):\n        query = \"\"\"\n        INSERT
+          INTO shopify_products_variants (\n            product_id, title, handle,
+          description, vendor, product_type, tags,\n            published_at, created_at,
+          updated_at,\n            variant_id, variant_title, option1, option2, option3,
+          sku, requires_shipping,\n            taxable, available, price, compare_at_price,
+          grams,\n            variant_created_at, variant_updated_at,\n            variant_featured_image_url,
+          variant_featured_image_width, variant_featured_image_height,\n            product_main_image_url,
+          product_main_image_width, product_main_image_height,\n            option_color,
+          option_size\n        ) VALUES (\n            %(product_id)s, %(title)s,
+          %(handle)s, %(description)s, %(vendor)s, %(product_type)s, %(tags)s,\n            %(published_at)s,
+          %(created_at)s, %(updated_at)s,\n            %(variant_id)s, %(variant_title)s,
+          %(option1)s, %(option2)s, %(option3)s, %(sku)s, %(requires_shipping)s,\n            %(taxable)s,
+          %(available)s, %(price)s, %(compare_at_price)s, %(grams)s,\n            %(variant_created_at)s,
+          %(variant_updated_at)s,\n            %(variant_featured_image_url)s, %(variant_featured_image_width)s,
+          %(variant_featured_image_height)s,\n            %(product_main_image_url)s,
+          %(product_main_image_width)s, %(product_main_image_height)s,\n            %(option_color)s,
+          %(option_size)s\n        )\n        ON DUPLICATE KEY UPDATE variant_updated_at=VALUES(variant_updated_at),
+          price=VALUES(price), available=VALUES(available);\n        \"\"\"\n\n        data
+          = {\n            ''product_id'': product.get(''id''),\n            ''title'':
+          product.get(''title''),\n            ''handle'': product.get(''handle''),\n            ''description'':
+          clean_html(product.get(''body_html'', '''')),\n            ''vendor'': product.get(''vendor''),\n            ''product_type'':
+          product.get(''product_type''),\n            ''tags'': json.dumps(product.get(''tags'',
+          [])),\n            ''published_at'': parse_datetime(product.get(''published_at'')),\n            ''created_at'':
+          parse_datetime(product.get(''created_at'')),\n            ''updated_at'':
+          parse_datetime(product.get(''updated_at'')),\n\n            ''variant_id'':
+          variant.get(''id''),\n            ''variant_title'': variant.get(''title''),\n            ''option1'':
+          variant.get(''option1''),\n            ''option2'': variant.get(''option2''),\n            ''option3'':
+          variant.get(''option3''),\n            ''sku'': variant.get(''sku''),\n            ''requires_shipping'':
+          variant.get(''requires_shipping''),\n            ''taxable'': variant.get(''taxable''),\n            ''available'':
+          variant.get(''available''),\n            ''price'': float(variant.get(''price''))
+          if variant.get(''price'') else None,\n            ''compare_at_price'':
+          float(variant.get(''compare_at_price'')) if variant.get(''compare_at_price'')
+          else None,\n            ''grams'': variant.get(''grams''),\n            ''variant_created_at'':
+          parse_datetime(variant.get(''created_at'')),\n            ''variant_updated_at'':
+          parse_datetime(variant.get(''updated_at'')),\n\n            ''variant_featured_image_url'':
+          safe_get(variant_image, ''src''),\n            ''variant_featured_image_width'':
+          safe_get(variant_image, ''width''),\n            ''variant_featured_image_height'':
+          safe_get(variant_image, ''height''),\n\n            ''product_main_image_url'':
+          safe_get(product_image, ''src''),\n            ''product_main_image_width'':
+          safe_get(product_image, ''width''),\n            ''product_main_image_height'':
+          safe_get(product_image, ''height''),\n\n            ''option_color'': variant.get(''option1''),\n            ''option_size'':
+          variant.get(''option2'')\n        }\n\n        cursor.execute(query, data)\n\n    def
+          scrape_and_insert(domain, conn):\n        page = 1\n        cursor = conn.cursor()\n        total_products
+          = 0\n        while True:\n            try:\n                response = requests.get(f\"https://{domain}/products.json?page={page}\",
+          timeout=30)\n                if response.status_code != 200:\n                    break\n                data
+          = response.json().get(''products'', [])\n                if not data:\n                    break\n                for
+          product in data:\n                    product_image = product.get(''images'',
+          [{}])[0] if product.get(''images'') else {}\n                    for variant
+          in product.get(''variants'', []):\n                        variant_image
+          = variant.get(''featured_image'', {}) or {}\n                        insert_variant(cursor,
+          product, variant, product_image, variant_image)\n                        total_products
+          += 1\n                page += 1\n            except Exception as e:\n                break\n        conn.commit()\n        cursor.close()\n        return
+          total_products\n\n    domains = json.loads(domains_json)\n    total_scraped
+          = 0\n    success = []\n    fail = []\n    try:\n        conn = mysql.connector.connect(host=db_host,
+          user=db_user, password=db_password, database=db_name)\n        for domain
+          in domains:\n            try:\n                count = scrape_and_insert(domain,
+          conn)\n                total_scraped += count\n                success.append(domain)\n            except:\n                fail.append(domain)\n        conn.close()\n        return
+          json.dumps({''status'': ''done'', ''ok'': success, ''fail'': fail}), str(total_scraped)\n    except
+          Exception as e:\n        return json.dumps({''status'': ''error'', ''error'':
+          str(e)}), \"0\"\n\ndef _serialize_str(str_value: str) -> str:\n    if not
+          isinstance(str_value, str):\n        raise TypeError(''Value \"{}\" has
+          type \"{}\" instead of str.''.format(\n            str(str_value), str(type(str_value))))\n    return
+          str_value\n\nimport argparse\n_parser = argparse.ArgumentParser(prog=''Web
+          scraping component'', description='''')\n_parser.add_argument(\"--domains-json\",
+          dest=\"domains_json\", type=str, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-host\",
+          dest=\"db_host\", type=str, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-user\",
+          dest=\"db_user\", type=str, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-password\",
+          dest=\"db_password\", type=str, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"--db-name\",
+          dest=\"db_name\", type=str, required=False, default=argparse.SUPPRESS)\n_parser.add_argument(\"----output-paths\",
+          dest=\"_output_paths\", type=str, nargs=2)\n_parsed_args = vars(_parser.parse_args())\n_output_files
+          = _parsed_args.pop(\"_output_paths\", [])\n\n_outputs = web_scraping_component(**_parsed_args)\n\n_output_serializers
+          = [\n    _serialize_str,\n    _serialize_str,\n\n]\n\nimport os\nfor idx,
+          output_file in enumerate(_output_files):\n    try:\n        os.makedirs(os.path.dirname(output_file))\n    except
+          OSError:\n        pass\n    with open(output_file, ''w'') as f:\n        f.write(_output_serializers[idx](_outputs[idx]))\n"],
+          "image": "python:3.9"}}, "inputs": [{"default": "[\"rowingblazers.com\"]",
+          "name": "domains_json", "optional": true, "type": "String"}, {"default":
+          "localhost", "name": "db_host", "optional": true, "type": "String"}, {"default":
+          "root", "name": "db_user", "optional": true, "type": "String"}, {"default":
+          "", "name": "db_password", "optional": true, "type": "String"}, {"default":
+          "ecommerce_data", "name": "db_name", "optional": true, "type": "String"}],
+          "name": "Web scraping component", "outputs": [{"name": "scraping_status",
+          "type": "String"}, {"name": "products_scraped", "type": "String"}]}', pipelines.kubeflow.org/component_ref: '{}',
+        pipelines.kubeflow.org/arguments.parameters: '{"db_host": "{{inputs.parameters.db_host}}",
+          "db_name": "{{inputs.parameters.db_name}}", "db_password": "{{inputs.parameters.db_password}}",
+          "db_user": "{{inputs.parameters.db_user}}", "domains_json": "{{inputs.parameters.domains_json}}"}'}
+      labels:
+        pipelines.kubeflow.org/kfp_sdk_version: 1.8.22
+        pipelines.kubeflow.org/pipeline-sdk-type: kfp
+        pipelines.kubeflow.org/enable_caching: "true"
+  arguments:
+    parameters:
+    - {name: db_host, value: localhost}
+    - {name: db_user, value: root}
+    - {name: db_password, value: ''}
+    - {name: db_name, value: ecommerce_data}
+    - {name: domains_json, value: '["rowingblazers.com", "glossier.com"]'}
+    - {name: n_clusters, value: '3'}
+    - {name: k, value: '10'}
+  serviceAccountName: pipeline-runner
