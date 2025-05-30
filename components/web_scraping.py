@@ -14,6 +14,8 @@ def web_scraping_component(
     import requests
     from datetime import datetime
     import logging
+    import json
+    from typing import NamedTuple
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 

@@ -2,7 +2,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Workflow
 metadata:
   generateName: ecommerce-ml-pipeline-
-  annotations: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.22, pipelines.kubeflow.org/pipeline_compilation_time: '2025-05-30T16:27:42.199829',
+  annotations: {pipelines.kubeflow.org/kfp_sdk_version: 1.8.22, pipelines.kubeflow.org/pipeline_compilation_time: '2025-05-30T18:59:24.111440',
     pipelines.kubeflow.org/pipeline_spec: '{"description": "Pipeline for eCommerce
       scraping, scoring, and top-k selection", "inputs": [{"default": "localhost",
       "name": "db_host", "optional": true, "type": "String"}, {"default": "root",
@@ -697,6 +697,8 @@ spec:
             import requests
             from datetime import datetime
             import logging
+            import json
+            from typing import NamedTuple
 
             logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -889,8 +891,8 @@ spec:
           = ''localhost'',\n    db_user = ''root'',\n    db_password = '''',\n    db_name
           = ''ecommerce_data''\n):\n    from bs4 import BeautifulSoup\n    import
           mysql.connector\n    import requests\n    from datetime import datetime\n    import
-          logging\n\n    logging.basicConfig(level=logging.INFO, format=''%(asctime)s
-          - %(levelname)s - %(message)s'')\n\n    def clean_html(html):\n        return
+          logging\n    import json\n    from typing import NamedTuple\n\n    logging.basicConfig(level=logging.INFO,
+          format=''%(asctime)s - %(levelname)s - %(message)s'')\n\n    def clean_html(html):\n        return
           BeautifulSoup(html, \"html.parser\").get_text(separator=\" \", strip=True)\n\n    def
           safe_get(obj, *keys, default=None):\n        for key in keys:\n            obj
           = obj.get(key) if isinstance(obj, dict) else None\n            if obj is
